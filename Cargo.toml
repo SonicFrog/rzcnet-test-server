@@ -1,0 +1,13 @@
+[package]
+name = "dummy_server"
+version = "0.1.0"
+authors = ["Ogier Bouvier <ars3nic@ars3nic.ch>"]
+edition = "2018"
+
+[dependencies]
+netif = { path = "../netif", features = ["server"] }
+nix = "*"
+libc = "*"
+error-chain = "*"
+log = "*"
+pretty_env_logger = "*"

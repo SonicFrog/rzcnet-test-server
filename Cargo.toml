@@ -5,7 +5,8 @@ authors = ["Ogier Bouvier <ars3nic@ars3nic.ch>"]
 edition = "2018"
 
 [dependencies]
-netif = { path = "../netif", features = ["server"] }
+netif = { path = "../netif" }
+bounded-spsc-queue = "*"
 nix = "*"
 libc = "*"
 error-chain = "*"

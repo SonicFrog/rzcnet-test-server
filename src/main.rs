@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate error_chain;
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -21,6 +22,7 @@ use nix::fcntl::{open, OFlag};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::stat::Mode;
 
+/// Hugepage size
 const LEN: usize = 2048 * 1024;
 
 error_chain! {
@@ -135,12 +137,7 @@ impl Runnable for DummySched {
             }
 
             while let Some(socket) = self.socket_in.try_pop() {
-                info!(
-                    "new socket {}:{} for client {}",
-                    socket.addr(),
-                    socket.port(),
-                    socket.id()
-                );
+                info!("scheduler received socket {}", socket.id());
 
                 SOCKETS.with(move |sockets| {
                     sockets.borrow_mut().insert(socket.id(), socket);
@@ -148,16 +145,24 @@ impl Runnable for DummySched {
             }
 
             while let Some(pkt) = self.packets.try_pop() {
-                trace!("delivering one packet to socket {}", pkt.id());
+                trace!("fake delivering one packet to socket {}", pkt.id());
                 SOCKETS.with(|sockets| {
                     if let Some(socket) = sockets.borrow().get(&pkt.id()) {
-                        info!(
-                            "delivering packet to socket {} with addr {}:{}",
-                            socket.id(),
-                            socket.addr(),
-                            socket.port()
-                        );
-                        socket.deliver(&(), &[pkt], (socket.addr(), socket.port()));
+                        info!("found socket {}", socket.id());
+                        match (socket as &dyn Any).downcast_ref::<DummySocket>() {
+                            Some(concrete) => CLIENTS.with(|clients| {
+                                if let Some((ref _input, ref mut output)) =
+                                    clients.borrow_mut().get_mut(&concrete.pid)
+                                {
+                                    output.push_all(&[pkt]).expect("failed to push packets");
+                                } else {
+                                    error!("unknown client PID {}", concrete.pid);
+                                }
+                            }),
+                            None => error!("bad socket type!"),
+                        }
+                    } else {
+                        error!("unknown socket {}", pkt.id())
                     }
                 })
             }
@@ -230,12 +235,14 @@ fn main() -> Result<()> {
     });
     let mut ctx = ServerContext::new(hp_info, client_cb, socket_cb)?;
 
-    thread::spawn(move || {
+    let _handle = thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
         info!("delivering one dummy packet");
-        pkt_prod.push(ShmPacket::default());
-    });
 
+        if pkt_prod.try_push(ShmPacket::default()).is_some() {
+            error!("failed to push packet");
+        }
+    });
     ctx.run()?;
     unsafe { munmap(base, LEN) }?;
 

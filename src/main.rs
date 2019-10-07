@@ -1,16 +1,21 @@
 #[macro_use]
 extern crate error_chain;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::ptr;
+use std::result::Result as StdRes;
 use std::thread;
+use std::time::Duration;
 
 use bounded_spsc_queue::{make, Consumer};
 
-use log::{debug, info, error};
+use log::{debug, error, info, trace};
 
-use netif::*;
 use netif::server::*;
+use netif::Error as NetErr;
+use netif::*;
 
 use nix::fcntl::{open, OFlag};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
@@ -29,29 +34,93 @@ error_chain! {
     }
 }
 
+thread_local! {
+    static SOCKETS: RefCell<HashMap<u32, Box<dyn Socket<Addr, ()>>>> = RefCell::new(HashMap::new());
+    static CLIENTS: RefCell<HashMap<u32, QueuePair>> = RefCell::new(HashMap::new());
+}
+
+type Addr = (Ipv4Addr, u16);
+
+type QueuePair = (ShmContainer<ShmPacket>, ShmContainer<ShmPacket>);
+
+struct DummySocket {
+    pid: u32,
+    sid: u32,
+    ip: Ipv4Addr,
+    port: u16,
+    proto: IpProto,
+}
+
+impl DummySocket {
+    fn new(pid: u32, sid: u32, ip: Ipv4Addr, port: u16, proto: IpProto) -> Self {
+        DummySocket {
+            pid,
+            sid,
+            ip,
+            port,
+            proto,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl Shared for DummySocket {
+    fn id(&self) -> u32 {
+        self.sid
+    }
+}
+
+impl PacketHandler<Addr, ()> for DummySocket {
+    fn deliver(&self, _: &(), pkt: &[ShmPacket], addr: Addr) {
+        info!(
+            "delivered {} packets from {}:{} to {}",
+            pkt.len(),
+            addr.0,
+            addr.1,
+            self.id()
+        );
+    }
+}
+
+impl Socket<Addr, ()> for DummySocket {
+    fn send_to(
+        &self,
+        pkts: &mut dyn Iterator<Item = OutPacket>,
+        addr: Addr,
+    ) -> StdRes<usize, NetErr> {
+        info!("sent {} packets to {}:{}", pkts.count(), addr.0, addr.1);
+        Ok(0)
+    }
+
+    fn addr(&self) -> Ipv4Addr {
+        self.ip
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
 struct DummySched {
-    command: Consumer<SchedulerClosure>,
+    socket_in: Consumer<Box<dyn Socket<Addr, ()>>>,
+    client_in: Consumer<(u32, QueuePair)>,
+    packets: Consumer<ShmPacket>,
 }
 
 impl DummySched {
-    fn new(command: Consumer<SchedulerClosure>) -> Self {
+    fn new(
+        socket_in: Consumer<Box<dyn Socket<Addr, ()>>>,
+        client_in: Consumer<(u32, QueuePair)>,
+        packets: Consumer<ShmPacket>,
+    ) -> Self {
         Self {
-            command,
+            socket_in,
+            client_in,
+            packets,
         }
-    }
-}
-
-impl ServerScheduler for DummySched {
-    fn register(&mut self, pid: u32, id: u32, addr: Ipv4Addr, port: u16, proto: IpProto) {
-        info!("registering {}:{} as {} for client {}", addr, port, proto, pid);
-    }
-
-    fn add_in(&mut self, pid: u32, queue: ShmContainer<ShmPacket>) {
-        info!("adding input queue {} for client {}", pid, queue);
-    }
-
-    fn add_out(&mut self, pid: u32, queue: ShmContainer<ShmPacket>) {
-        info!("adding output queue {} for client {}", pid, queue);
     }
 }
 
@@ -60,9 +129,37 @@ impl Runnable for DummySched {
 
     fn run(&mut self) -> std::result::Result<(), Self::Error> {
         loop {
-            if let Some(closure) = self.command.try_pop() {
-                info!("applying closure on scheduler");
-                (closure)(self)
+            while let Some((id, queues)) = self.client_in.try_pop() {
+                info!("new client {}", id);
+                CLIENTS.with(move |clients| clients.borrow_mut().insert(id, queues));
+            }
+
+            while let Some(socket) = self.socket_in.try_pop() {
+                info!(
+                    "new socket {}:{} for client {}",
+                    socket.addr(),
+                    socket.port(),
+                    socket.id()
+                );
+
+                SOCKETS.with(move |sockets| {
+                    sockets.borrow_mut().insert(socket.id(), socket);
+                })
+            }
+
+            while let Some(pkt) = self.packets.try_pop() {
+                trace!("delivering one packet to socket {}", pkt.id());
+                SOCKETS.with(|sockets| {
+                    if let Some(socket) = sockets.borrow().get(&pkt.id()) {
+                        info!(
+                            "delivering packet to socket {} with addr {}:{}",
+                            socket.id(),
+                            socket.addr(),
+                            socket.port()
+                        );
+                        socket.deliver(&(), &[pkt], (socket.addr(), socket.port()));
+                    }
+                })
             }
         }
     }
@@ -75,40 +172,72 @@ fn main() -> Result<()> {
     debug!("creating huge page at {}", path);
 
     let f = open(path, OFlag::O_CREAT | OFlag::O_RDWR, Mode::all())?;
-    let base = unsafe { mmap(
-        ptr::null_mut(),
-        LEN,
-        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-        MapFlags::MAP_SHARED | MapFlags::MAP_HUGETLB,
-        f,
-        0
-    )}?;
+    let base = unsafe {
+        mmap(
+            ptr::null_mut(),
+            LEN,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_SHARED | MapFlags::MAP_HUGETLB,
+            f,
+            0,
+        )
+    }?;
     let hp_info = vec![HugeInfo::new(base as *mut u8, LEN, f)];
 
     for h in &hp_info {
         debug!("{}", h);
     }
 
-    // creating the scheduler command channel
-    let (prod, cons) = make(32);
-
-    let producers = vec![prod];
-
+    let (pkt_prod, pkt_cons) = make(32);
+    let (sock_prod, sock_cons) = make(32);
+    let (client_prod, client_cons) = make(32);
 
     // spawning the dummy scheduler
     thread::spawn(move || {
-        if let Err(e) = DummySched::new(cons).run() {
+        if let Err(e) = DummySched::new(sock_cons, client_cons, pkt_cons).run() {
             error!("scheduler failed: {}", e);
         }
     });
 
-    let mut ctx = ServerContext::new(hp_info, producers)?;
+    let client_cb = Box::new(move |pid, idx, pair| {
+        info!(
+            "new client queue registered for PID {} with index {}",
+            pid, idx
+        );
+
+        client_prod.push((pid, pair));
+
+        0i32
+    });
+    let socket_cb = Box::new(move |pid, sid, ip: u32, port, proto: u8| {
+        info!(
+            "new socket for client {} with id {} and destination {}:{}",
+            pid,
+            sid,
+            Ipv4Addr::from(ip),
+            port
+        );
+
+        sock_prod.push(Box::new(DummySocket::new(
+            pid,
+            sid,
+            ip.into(),
+            port,
+            proto.into(),
+        )));
+
+        0
+    });
+    let mut ctx = ServerContext::new(hp_info, client_cb, socket_cb)?;
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(1));
+        info!("delivering one dummy packet");
+        pkt_prod.push(ShmPacket::default());
+    });
 
     ctx.run()?;
-
-    unsafe {
-        munmap(base, LEN)
-    }?;
+    unsafe { munmap(base, LEN) }?;
 
     Ok(())
 }
